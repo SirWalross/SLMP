@@ -161,6 +161,40 @@ class SLMP {
         None = 0x0000,
     };
 
+    enum class Endcode : uint16_t {
+        Success = 0x0000,
+        InvalidEndCode = 0x0001,
+        WrongCommand = 0xC059,
+        WrongFormat = 0xC05C,
+        WrongLength = 0xC061,
+        Busy = 0xCEE0,
+        ExceedReqLength = 0xCEE1,
+        ExceedRespLength = 0xCEE2,
+        ServerNotFound = 0xCF10,
+        WrongConfigItem = 0xCF20,
+        PrmIDNotFound = 0xCF30,
+        NotStartExclusiveWrite = 0xCF31,
+        RelayFailure = 0xCF70,
+        TimeoutError = 0xCF71,
+        CANAppNotPermittedRead = 0xCCC7,
+        CANAppWriteOnly = 0xCCC8,
+        CANAppReadOnly = 0xCCC9,
+        CANAppUndefinedObjectAccess = 0xCCCA,
+        CANAppNotPermittedPDOMapping = 0xCCCB,
+        CANAppExceedPDOMapping = 0xCCCC,
+        CANAppNotExistSubIndex = 0xCCD3,
+        CANAppWrongParameter = 0xCCD4,
+        CANAppMoreOverParameterRange = 0xCCD5,
+        CANAppLessOverParameterRange = 0xCCD6,
+        CANAppTransOrStoreError = 0xCCDA,
+        CANAppOtherError = 0xCCFF,
+        OtherNetworkError = 0xCF00,
+        DataFragmentShortage = 0xCF40,
+        DataFragmentDup = 0xCF41,
+        DataFragmentLost = 0xCF43,
+        DataFragmentNotSupport = 0xCF44
+    };
+
     SLMP(const char* addr, int port) : socket(addr, port), buffer(buffer_size, 0) {
         header_size = request_data.size() + 4;  // command and subcommand are counted as part of header
         request_data.resize(request_data_size);
