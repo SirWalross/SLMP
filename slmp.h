@@ -74,7 +74,7 @@ class Socket {
         return numbytes;
     }
 
-    std::optional<SSIZE_T> recv(void* recvData, const ::size_t& size) {
+    std::optional<int> recv(void* recvData, const ::size_t& size) {
         const auto numbytes = ::recv(socket, static_cast<char*>(recvData), size - 1, 0);
         if (numbytes == SOCKET_ERROR) {
             return {};
@@ -105,7 +105,7 @@ class SLMP {
                                                     {0x04, 2}, {0x05, 4}, {0x06, 4}, {0x07, 8}};
 
    public:
-    enum class Request_Command : uint16_t {
+    enum class RequestCommand : uint16_t {
         Read = 0x0401,
         Write = 0x1401,
         LabelRead = 0x041A,
@@ -114,7 +114,7 @@ class SLMP {
         RandomLabelWrite = 0x141b
     };
 
-    enum class Response_Command : uint8_t { Read = 0x01, LabelRead = 0x02, RandomLabelRead = 0x03 };
+    enum class ResponseCommand : uint8_t { Read = 0x01, LabelRead = 0x02, RandomLabelRead = 0x03 };
 
     enum class Subcommand : uint8_t {
         Bit = 0x01,
@@ -159,9 +159,9 @@ class SLMP {
         None = 0x0050,
     };
 
-    enum class Networknumber : uint8_t { A = 0x00 };
+    enum class NetworkNumber : uint8_t { A = 0x00 };
 
-    enum class Stationnumber : uint8_t { A = 0xFF };
+    enum class StationNumber : uint8_t { A = 0xFF };
 
     enum class DestinationModule : uint16_t {
         CPU = 0x03FF,
@@ -213,163 +213,181 @@ class SLMP {
         InvalidGlobalLabel = 0x40C0
     };
 
-    SLMP(const char* addr, int port) : socket(addr, port), buffer(buffer_size, 0) {
+    SLMP(const char *addr, int port, NetworkNumber network_no, StationNumber station_no, DestinationModule module_io,
+         DestinationStation multidrop_station_no)
+        : socket(addr, port), buffer(buffer_size), request_data{SLMP_SHIFT_UINT16_T(Serialnumber::None),
+                                                                SLMP_SHIFT_UINT8_T(network_no),
+                                                                SLMP_SHIFT_UINT8_T(station_no),
+                                                                SLMP_SHIFT_UINT16_T(module_io),
+                                                                SLMP_SHIFT_UINT8_T(multidrop_station_no),
+                                                                SLMP_SHIFT_UINT16_T(0),
+                       SLMP_SHIFT_UINT16_T(MonitoringTimer::None)},
+          connected{false} {
         header_size = request_data.size() + 4;  // command and subcommand are counted as part of header
-        request_data.resize(request_data_size);
-        if (!socket.connect(2000).has_value()) {
-            fmt::print("SLMP connection to {}:{} failed with error {}\n", addr, port, WSAGetLastError());
+        request_data.reserve(request_data_size);
+    }
+
+    void disconnect() {
+        connected = false;
+    }
+
+    std::optional<int> connect() {
+        if (!socket.connect(100).has_value()) {
+            fmt::print("SLMP connection to {}:{} failed with error {}\n", socket.addr, socket.port, WSAGetLastError());
             throw std::exception();
         }
+        connected = true;
     }
 
     ~SLMP() {}
 
-    std::optional<uint8_t*> read_request(Device device, Subcommand subcommand, uint32_t head_no, uint16_t number) {
-        request_data[header_size] = head_no & 0xff;
-        request_data[header_size + 1] = (head_no >> 8) & 0xff;
-        request_data[header_size + 2] = (head_no >> 16) & 0xff;
-        request_data[header_size + 3] = static_cast<uint8_t>(device);
-        request_data[header_size + 4] = number & 0xff;
-        request_data[header_size + 5] = (number >> 8) & 0xff;
-        return request(Request_Command::Read, subcommand, header_size + 6);
+    std::optional<int32_t> read_request(Device device, Subcommand subcommand, uint32_t head_no,
+                                        std::span<uint16_t> data) {
+        request_data.push_back(head_no & 0xff);
+        request_data.push_back((head_no >> 8) & 0xff);
+        request_data.push_back((head_no >> 16) & 0xff);
+        request_data.push_back(static_cast<uint8_t>(device));
+        request_data.push_back(data.size() & 0xff);
+        request_data.push_back((data.size() >> 8) & 0xff);
+
+        const auto retval = request(RequestCommand::Read, subcommand);
+
+        if (retval.has_value()) {
+            return response(RequestCommand::Read, subcommand, data, retval.value());
+        }
+        return retval;
     }
 
-    template <class T, Subcommand subcommand, size_t size,
-              typename = std::enable_if<subcommand == Subcommand::Word || std::is_same<T, uint8_t>::value>::type>
-    std::optional<uint8_t*> write_request(Device device, uint32_t head_no, std::array<T, size> data) {
-        constexpr auto write_data_size = [&]() {
-            if constexpr (subcommand == Subcommand::Bit) {
-                return (size * sizeof(T) + 1) / 2;  // to round up
+    template <class T>
+    std::optional<int32_t> write_request(Device device, Subcommand subcommand, uint32_t head_no, std::span<T> data) {
+        const auto write_data_size = [&]() {
+            if (subcommand == Subcommand::Bit) {
+                return (data.size() * sizeof(T) + 1) / 2;  // to round up
             } else {
-                return size * sizeof(T);
+                return data.size() * sizeof(T);
             }
         }();
-        constexpr auto device_count = [&]() {
-            if constexpr (subcommand == Subcommand::Word) {
-                return (size * sizeof(T) + 1) / 2;  // to round up
+        const auto device_count = [&]() {
+            if (subcommand == Subcommand::Word) {
+                return (data.size() * sizeof(T) + 1) / 2;  // to round up
             } else {
-                return size * sizeof(T);
+                return data.size() * sizeof(T);
             }
         }();
-        ;
-        // fmt::print("write_data_size: {}, device_count: {}\n", write_data_size, device_count);
+
         assert((write_data_size + header_size + 6) <= request_data_size && "Write request too big");
-        if constexpr (subcommand == Subcommand::Bit) {
+        request_data.push_back(head_no & 0xff);
+        request_data.push_back((head_no >> 8) & 0xff);
+        request_data.push_back((head_no >> 16) & 0xff);
+        request_data.push_back(static_cast<uint8_t>(device));
+        request_data.push_back(device_count.size() & 0xff);
+        request_data.push_back((device_count.size() >> 8) & 0xff);
+        if (subcommand == Subcommand::Bit) {
             for (int i = 0; i < write_data_size; i++) {
-                request_data[header_size + 6 + i] = (data[i * 2] << 4) + data[i * 2 + 1];
+                request_data.push_back((data[i * 2] << 4) + data[i * 2 + 1]);
             }
         } else {
+            request_data.resize(request_data.size() + write_data_size);
             std::memcpy(request_data.data() + 6 + header_size, data.data(), write_data_size);
         }
-        request_data[header_size] = head_no & 0xff;
-        request_data[header_size + 1] = (head_no >> 8) & 0xff;
-        request_data[header_size + 2] = (head_no >> 16) & 0xff;
-        request_data[header_size + 3] = static_cast<uint8_t>(device);
-        request_data[header_size + 4] = device_count & 0xff;
-        request_data[header_size + 5] = (device_count >> 8) & 0xff;
-        return request(Request_Command::Write, subcommand, header_size + 6 + write_data_size);
+        return request(RequestCommand::Write, subcommand);
     }
 
-    template <size_t size>
-    std::optional<uint8_t*> label_read_request(std::array<std::string, size> label_names) {
-        constexpr auto sizes =
-            label_names | std::views::transform([](const auto& string) { return 2 * string.size() + 2; });
+    template <class T>
+    std::optional<int32_t> label_read_request(std::span<std::string> label_names, std::span<T> label_data) {
+        auto sizes = label_names | std::views::transform([](const auto& string) { return 2 * string.size() + 2; });
         const std::size_t read_data_size = 4 + std::accumulate(sizes.begin(), sizes.end(), 0);
         assert((read_data_size + header_size) <= request_data_size && "Read request too big");
 
-        std::size_t last_index = header_size + 4;
-        for (std::size_t i = 0; i < label_names.size(); i++) {
-            request_data[last_index] = label_names[i].size() & 0xff;
-            request_data[last_index + 1] = (label_names[i].size() >> 8) & 0xff;
-            for (std::size_t j = 0; j < label_names[i].size(); j++) {
-                request_data[last_index + 2 + j * 2] = label_names[i][j];
-                request_data[last_index + 2 + j * 2 + 1] = 0;
-            }
-            last_index += 2 + label_names[i].size() * 2;
-        }
+        request_data.push_back(label_names.size() & 0xff);
+        request_data.push_back((label_names.size() >> 8) & 0xff);
+        request_data.push_back(0);
+        request_data.push_back(0);
 
-        request_data[header_size] = label_names.size() & 0xff;
-        request_data[header_size + 1] = (label_names.size() >> 8) & 0xff;
-        request_data[header_size + 2] = 0;
-        request_data[header_size + 3] = 0;
-        return request(Request_Command::RandomLabelRead, Subcommand::Word, read_data_size + header_size);
+        for (std::size_t i = 0; i < label_names.size(); i++) {
+            request_data.push_back(label_names[i].size() & 0xff);
+            request_data.push_back((label_names[i].size() >> 8) & 0xff);
+            for (std::size_t j = 0; j < label_names[i].size(); j++) {
+                request_data.push_back(label_names[i][j]);
+                request_data.push_back(0);
+            }
+        }
+        const auto retval = request(RequestCommand::RandomLabelRead, Subcommand::Word);
+
+        if (retval.has_value()) {
+            return response(RequestCommand::RandomLabelRead, Subcommand::Word, label_data, retval.value());
+        }
+        return retval;
     }
 
-    template <class T, size_t size>
-    std::optional<uint8_t*> label_write_request(std::array<std::string, size> label_names,
-                                                std::array<T, size> label_data) {
-        constexpr auto write_data_length = 2 * ((sizeof(T) + 1) / 2);  // to round uint8_t up to 2
-        constexpr auto sizes = label_names | std::views::transform([](const auto& string) -> std::size_t {
-                                   return 2 * string.size() + 4 + write_data_length;
-                               });
+    template <class T>
+    std::optional<int32_t> label_write_request(std::span<std::string> label_names, std::span<T> label_data) {
+        auto write_data_length = 2 * ((sizeof(T) + 1) / 2);  // to round uint8_t up to 2
+        auto sizes = label_names | std::views::transform([&](const auto& string) -> std::size_t {
+                         return 2 * string.size() + 4 + write_data_length;
+                     });
         const std::size_t write_data_size = 4 + std::accumulate(sizes.begin(), sizes.end(), 0);
         assert((write_data_size + header_size) <= request_data_size && "Write request too big");
 
-        std::size_t last_index = header_size + 4;
-        for (std::size_t i = 0; i < label_names.size(); i++) {
-            request_data[last_index] = label_names[i].size() & 0xff;
-            request_data[last_index + 1] = (label_names[i].size() >> 8) & 0xff;
-            for (std::size_t j = 0; j < label_names[i].size(); j++) {
-                request_data[last_index + 2 + j * 2] = label_names[i][j];
-                request_data[last_index + 2 + j * 2 + 1] = 0;
-            }
-            request_data[last_index + 2 + label_names[i].size() * 2] = write_data_length & 0xff;
-            request_data[last_index + 3 + label_names[i].size() * 2] = (write_data_length >> 8) & 0xff;
-            std::memcpy(request_data.data() + last_index + label_names[i].size() * 2 + 4, label_data.data() + i,
-                        sizeof(T));
-            last_index += 4 + label_names[i].size() * 2 + write_data_length;
-        }
+        request_data.push_back(label_names.size() & 0xff);
+        request_data.push_back((label_names.size() >> 8) & 0xff);
+        request_data.push_back(0);
+        request_data.push_back(0);
 
-        request_data[header_size] = label_names.size() & 0xff;
-        request_data[header_size + 1] = (label_names.size() >> 8) & 0xff;
-        request_data[header_size + 2] = 0;
-        request_data[header_size + 3] = 0;
-        return request(Request_Command::RandomLabelWrite, Subcommand::Word, write_data_size + header_size);
+        for (std::size_t i = 0; i < label_names.size(); i++) {
+            request_data.push_back(label_names[i].size() & 0xff);
+            request_data.push_back((label_names[i].size() >> 8) & 0xff);
+            for (std::size_t j = 0; j < label_names[i].size(); j++) {
+                request_data.push_back(label_names[i][j]);
+                request_data.push_back(0);
+            }
+            request_data.push_back(write_data_length & 0xff);
+            request_data.push_back((write_data_length >> 8) & 0xff);
+            request_data.resize(request_data.size() + sizeof(T));
+            std::memcpy(&request_data.back() - sizeof(T), label_data.data() + i, sizeof(T));
+        }
+        return request(RequestCommand::RandomLabelWrite, Subcommand::Word);
     }
 
+    volatile bool connected;
+
    private:
-    void response(Request_Command command, Subcommand subcommand, ::size_t response_length) {
-        fmt::print("Serial no. {:04x}\n", buffer[0] + (static_cast<uint32_t>(buffer[1]) << 8));
-        fmt::print("Request destination network no. {:02x}\n", buffer[2]);
-        fmt::print("Request destination station no. {:02x}\n", buffer[3]);
-        fmt::print("Request destination module I/O no. {:04x}\n", buffer[4] + (static_cast<uint32_t>(buffer[5]) << 8));
-        fmt::print("Request destination multidrop station no. {:02x}\n", buffer[6]);
-        fmt::print("Response data length {}\n", buffer[7] + (static_cast<uint32_t>(buffer[8]) << 8));
+    template <class T>
+    std::optional<int> response(RequestCommand command, Subcommand subcommand, std::span<T> read_data,
+                                std::size_t response_length) {
         const auto end_code = buffer[9] + (static_cast<uint32_t>(buffer[10]) << 8);
-        fmt::print("Response end code {:04x}\n", end_code);
 
         if (end_code != 0) {
-            return;
+            return {};
         }
 
-        if (command == Request_Command::Read) {
+        std::size_t i = 0;
+        if (command == RequestCommand::Read) {
             if (subcommand == Subcommand::Word) {
-                for (std::size_t i = 0; i < (response_length - 10) / 2; i++) {
-                    fmt::print("[{}]: {:x}\n", i,
-                               buffer[11 + 2 * i] * (static_cast<uint32_t>(buffer[12 + 2 * i]) << 8));
+                for (i = 0; i < (response_length - 10) / 2; i++) {
+                    read_data[i] = buffer[11 + 2 * i] * (static_cast<uint32_t>(buffer[12 + 2 * i]) << 8);
                 }
             } else {
-                for (std::size_t i = 0; i < (response_length - 11) * 2; i++) {
-                    fmt::print("[{}]: {:x}\n", i, (buffer[11 + i / 2] >> ((i % 2) ? 0 : 4)) & 0x0f);
+                for (i = 0; i < (response_length - 11) * 2; i++) {
+                    read_data[i] = (buffer[11 + i / 2] >> ((i % 2) ? 0 : 4)) & 0x0f;
                 }
             }
-        } else if (command == Request_Command::RandomLabelRead) {
+        } else if (command == RequestCommand::RandomLabelRead) {
             assert(buffer[11] + (static_cast<uint32_t>(buffer[12]) << 8) ==
-                       static_cast<uint32_t>(Request_Command::RandomLabelWrite) &&
+                       static_cast<uint32_t>(RequestCommand::RandomLabelWrite) &&
                    "Invalid response command!");
             const std::size_t label_count = buffer[15] + (static_cast<uint32_t>(buffer[16]) << 8);
             std::size_t start_index = 19;
-            for (std::size_t i = 0; i < label_count; i++) {
+            for (i = 0; i < label_count; i++) {
                 const std::size_t label_size =
                     2 * (buffer[start_index] + (static_cast<uint32_t>(buffer[start_index + 1]) << 8));
                 const std::size_t data_size = buffer[start_index + label_size + 2] +
                                               (static_cast<uint32_t>(buffer[start_index + label_size + 3]) << 8);
-                fmt::print("[{}]: {:x}\n", i,
-                           fmt::join(buffer.begin() + start_index + label_size + 4,
-                                     buffer.begin() + start_index + label_size + 4 + data_size, ", "));
+                std::memcpy(&read_data[i], &buffer.front() + start_index + label_size + 4, data_size);
                 start_index += start_index + label_size + 4 + data_size;
             }
         }
+        return static_cast<int>(i);
     }
 
     Socket socket;
@@ -377,33 +395,29 @@ class SLMP {
     std::vector<uint8_t> buffer;
     std::size_t request_data_size = 1296;
     std::size_t header_size;
-    std::vector<uint8_t> request_data{
-        SLMP_SHIFT_UINT16_T(Serialnumber::None),   SLMP_SHIFT_UINT8_T(Networknumber::A),
-        SLMP_SHIFT_UINT8_T(Stationnumber::A),      SLMP_SHIFT_UINT16_T(DestinationModule::CPU),
-        SLMP_SHIFT_UINT8_T(DestinationStation::A), SLMP_SHIFT_UINT16_T(0),
-        SLMP_SHIFT_UINT16_T(MonitoringTimer::None)};
+    std::vector<uint8_t> request_data;
 
-    std::optional<uint8_t*> request(Request_Command command, Subcommand subcommand, std::size_t request_size) {
-        auto request_data_length = request_size - header_size + 6;  // include monitoring timer, command and subcommand
-        request_data[7] = request_data_length & 0xff;
-        request_data[8] = (request_data_length >> 8) & 0xff;
+    std::optional<int> request(RequestCommand command, Subcommand subcommand) {
+        request_data[7] = (request_data.size() - header_size) & 0xff;
+        request_data[8] = ((request_data.size() - header_size) >> 8) & 0xff;
         request_data[11] = static_cast<uint16_t>(command) & 0xff;
         request_data[12] = (static_cast<uint16_t>(command) >> 8) & 0xff;
         request_data[13] = static_cast<uint16_t>(subcommand) & 0xff;
         request_data[14] = (static_cast<uint16_t>(subcommand) >> 8) & 0xff;
 
-        fmt::print("{:02x}\n", fmt::join(request_data.begin(), request_data.begin() + request_size, ","));
-        const auto send_result = socket.send(request_data.data(), request_size);
+        const auto send_result = socket.send(request_data.data(), request_data.size());
+        fmt::print("{:02x}\n", fmt::join(request_data.begin(), request_data.end(), ","));
+        request_data.resize(header_size);
         if (!send_result.has_value()) {
+            this->disconnect();
             return {};
         }
         const auto recv_result = socket.recv(buffer.data(), buffer.size());
         if (!recv_result.has_value()) {
-            fmt::print("Didnt get answer: {}!\n", WSAGetLastError());
+            this->disconnect();
             return {};
         }
-        fmt::print("{:02x}\n", fmt::join(buffer.begin(), buffer.begin() + recv_result.value(), ","));
-        response(command, subcommand, recv_result.value());
-        return buffer.data();
+
+        return recv_result;
     }
 };
